@@ -111,6 +111,45 @@ router.get('/reviews', async (req, res) => {
   return res.json({ reviews: reviews.map(reviewResponse) })
 })
 
+router.get('/reviews/mine', requireAuth, async (req, res) => {
+  const reviews = await prisma.review.findMany({
+    where: { userId: req.user.id },
+    select: {
+      id: true,
+      vehicleRating: true,
+      driverRating: true,
+      serviceRating: true,
+      comment: true,
+      createdAt: true,
+      updatedAt: true,
+      booking: {
+        select: {
+          id: true,
+          bookingNumber: true,
+          bookingType: true,
+          driverOption: true,
+          startDate: true,
+          endDate: true,
+          startTime: true,
+          endTime: true,
+          status: true,
+          vehicle: {
+            select: {
+              id: true,
+              brand: true,
+              name: true,
+              model: true,
+            },
+          },
+        },
+      },
+    },
+    orderBy: { createdAt: 'desc' },
+  })
+
+  return res.json({ reviews })
+})
+
 router.post('/:id/review', requireAuth, async (req, res) => {
   const {
     vehicleRating, driverRating, serviceRating, comment,
