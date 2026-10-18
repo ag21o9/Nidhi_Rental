@@ -25,6 +25,13 @@ export function requireAdmin(req, res, next) {
   return next()
 }
 
+export function requireAdminOrStaff(req, res, next) {
+  if (!['ADMIN', 'STAFF'].includes(req.user?.role)) {
+    return res.status(403).json({ message: 'Admin or staff access is required' })
+  }
+  return next()
+}
+
 export function createToken(user) {
   return jwt.sign({ id: user.id, email: user.email, role: user.role }, jwtSecret, {
     expiresIn: '7d',

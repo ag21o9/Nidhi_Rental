@@ -4,6 +4,7 @@ import { createToken, requireAuth } from '../middleware/auth.js'
 
 const router = Router()
 const locationKinds = ['HOME', 'WORK', 'GYM', 'AIRPORT', 'OTHER']
+const devicePlatforms = ['IOS', 'ANDROID', 'WEB']
 
 function publicUser(user) {
   const { passwordHash, ...safeUser } = user
@@ -42,9 +43,9 @@ router.post('/login', async (req, res) => {
 
 router.post('/bootstrap-admin', async (req, res) => {
   const setupKey = process.env.ADMIN_SETUP_KEY
-  // if (!setupKey || req.headers['x-admin-setup-key'] !== setupKey) {
-  //   return res.status(403).json({ message: 'Admin setup is not enabled' })
-  // }
+  if (!setupKey || req.headers['x-admin-setup-key'] !== setupKey) {
+    return res.status(403).json({ message: 'Admin setup is not enabled' })
+  }
 
   const { name, email, phone, password } = req.body
   if (!name || !email || !password) {
@@ -69,6 +70,55 @@ router.get('/me', requireAuth, async (req, res) => {
     return res.status(404).json({ message: 'User not found' })
   }
   return res.json({ user: publicUser(user) })
+})
+
+router.post('/notifications/token', requireAuth, async (req, res) => {
+  const {
+    expoPushToken,
+    token,
+    platform = 'ANDROID',
+    appVersion,
+    deviceId,
+  } = req.body
+  const pushToken = expoPushToken || token
+  console.log(pushToken);
+
+  if (!pushToken || typeof pushToken !== 'string') {
+    return res.status(400).json({ message: 'expoPushToken is required' })
+  }
+  if (!devicePlatforms.includes(platform)) {
+    return res.status(400).json({ message: 'platform must be IOS, ANDROID or WEB' })
+  }
+  if (appVersion !== undefined && typeof appVersion !== 'string') {
+    return res.status(400).json({ message: 'appVersion must be a string' })
+  }
+
+  let device
+  if (deviceId) {
+    device = await prisma.device.findFirst({ where: { id: deviceId, userId: req.user.id } })
+    if (!device) {
+      return res.status(404).json({ message: 'Device not found' })
+    }
+    device = await prisma.device.update({
+      where: { id: device.id },
+      data: { pushToken, platform, appVersion, isActive: true, lastUsedAt: new Date() },
+    })
+  } else {
+    device = await prisma.device.upsert({
+      where: { userId_pushToken: { userId: req.user.id, pushToken } },
+      update: { platform, appVersion, isActive: true, lastUsedAt: new Date() },
+      create: {
+        userId: req.user.id,
+        pushToken,
+        platform,
+        appVersion,
+        isActive: true,
+        lastUsedAt: new Date(),
+      },
+    })
+  }
+
+  return res.status(201).json({ device })
 })
 
 router.post('/saved-locations', requireAuth, async (req, res) => {

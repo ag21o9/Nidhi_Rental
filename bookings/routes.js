@@ -150,6 +150,26 @@ router.get('/reviews/mine', requireAuth, async (req, res) => {
   return res.json({ reviews })
 })
 
+router.get('/:id', requireAuth, async (req, res) => {
+  const booking = await prisma.booking.findUnique({
+    where: { id: req.params.id },
+    include: {
+      vehicle: true,
+      statusHistory: { orderBy: { createdAt: 'asc' } },
+      review: true,
+    },
+  })
+
+  if (!booking) {
+    return res.status(404).json({ message: 'Booking not found' })
+  }
+  if (booking.userId !== req.user.id && req.user.role !== 'ADMIN') {
+    return res.status(403).json({ message: 'You are not allowed to view this booking' })
+  }
+
+  return res.json({ booking })
+})
+
 router.post('/:id/review', requireAuth, async (req, res) => {
   const {
     vehicleRating, driverRating, serviceRating, comment,
