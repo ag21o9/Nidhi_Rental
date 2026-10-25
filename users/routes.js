@@ -81,7 +81,6 @@ router.post('/notifications/token', requireAuth, async (req, res) => {
     deviceId,
   } = req.body
   const pushToken = expoPushToken || token
-  console.log(pushToken);
 
   if (!pushToken || typeof pushToken !== 'string') {
     return res.status(400).json({ message: 'expoPushToken is required' })
@@ -119,6 +118,46 @@ router.post('/notifications/token', requireAuth, async (req, res) => {
   }
 
   return res.status(201).json({ device })
+})
+
+router.get('/notifications', requireAuth, async (req, res) => {
+  const page = Number(req.query.page || 1)
+  const pageSize = Number(req.query.pageSize || 25)
+  const unread = req.query.unread
+
+  if (!Number.isInteger(page) || page < 1 || !Number.isInteger(pageSize) || pageSize < 1 || pageSize > 100) {
+    return res.status(400).json({ message: 'page must be at least 1 and pageSize must be between 1 and 100' })
+  }
+  if (unread !== undefined && !['true', 'false'].includes(unread)) {
+    return res.status(400).json({ message: 'unread must be true or false' })
+  }
+
+  const where = {
+    userId: req.user.id,
+    ...(unread === 'true' && { readAt: null }),
+    ...(unread === 'false' && { readAt: { not: null } }),
+  }
+  const [notifications, total, unreadCount] = await Promise.all([
+    prisma.notification.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      skip: (page - 1) * pageSize,
+      take: pageSize,
+    }),
+    prisma.notification.count({ where }),
+    prisma.notification.count({ where: { userId: req.user.id, readAt: null } }),
+  ])
+
+  return res.json({
+    notifications,
+    unreadCount,
+    pagination: {
+      page,
+      pageSize,
+      total,
+      totalPages: Math.ceil(total / pageSize),
+    },
+  })
 })
 
 router.post('/saved-locations', requireAuth, async (req, res) => {

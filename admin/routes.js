@@ -253,6 +253,12 @@ router.post('/vehicles/:id/availability-block', async (req, res) => {
   const start = new Date(startAt)
   const end = new Date(endAt)
   if (!startAt || !endAt || Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start >= end) return res.status(400).json({ message: 'Valid startAt and endAt are required' })
+  const vehicle = await prisma.vehicle.findUnique({ where: { id: req.params.id }, select: { id: true } })
+  if (!vehicle) return res.status(404).json({ message: 'Vehicle not found' })
+  const existingBlock = await prisma.vehicleAvailability.findFirst({
+    where: { vehicleId: req.params.id, startAt: { lt: end }, endAt: { gt: start } },
+  })
+  if (existingBlock) return res.status(409).json({ message: 'This availability block overlaps an existing block' })
   const block = await prisma.vehicleAvailability.create({ data: { vehicleId: req.params.id, startAt: start, endAt: end, reason } })
   return res.status(201).json({ availabilityBlock: block })
 })

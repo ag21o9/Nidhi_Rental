@@ -910,9 +910,6 @@ model BookingMessage {
   @@map("booking_messages")
 }
 
-// ============================================================
-// LOYALTY
-// ============================================================
 
 model LoyaltyTransaction {
   id String @id @default(cuid())
