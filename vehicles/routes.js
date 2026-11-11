@@ -8,6 +8,15 @@ const allowedCategories = ['SEDAN', 'SUV', 'LUXURY', 'MUV', 'HATCHBACK', 'TEMPO_
 const allowedTransmissions = ['AUTOMATIC', 'MANUAL']
 const allowedFuelTypes = ['PETROL', 'DIESEL', 'ELECTRIC', 'HYBRID']
 
+function publicVehicle(vehicle) {
+  const safeVehicle = { ...vehicle }
+  delete safeVehicle.hourlyPrice
+  delete safeVehicle.dailyPrice
+  delete safeVehicle.eventPrice
+  delete safeVehicle.outstationPrice
+  return safeVehicle
+}
+
 function parseDay(value) {
   if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return null
   const day = new Date(`${value}T00:00:00.000Z`)
@@ -28,10 +37,6 @@ router.get('/', async (req, res) => {
     luggage,
     minLuggage,
     maxLuggage,
-    hourlyPrice,
-    maxHourlyPrice,
-    dailyPrice,
-    maxDailyPrice,
     available,
   } = req.query
 
@@ -43,10 +48,6 @@ router.get('/', async (req, res) => {
     luggage,
     minLuggage,
     maxLuggage,
-    hourlyPrice,
-    maxHourlyPrice,
-    dailyPrice,
-    maxDailyPrice,
   }
   const parsedNumbers = Object.fromEntries(
     Object.entries(numericFilters).map(([key, value]) => [key, value === undefined ? undefined : Number(value)]),
@@ -89,19 +90,13 @@ router.get('/', async (req, res) => {
     ...((minLuggage !== undefined || maxLuggage !== undefined) && {
       luggage: { gte: parsedNumbers.minLuggage, lte: parsedNumbers.maxLuggage },
     }),
-    ...((maxHourlyPrice !== undefined) && {
-      hourlyPrice: { lte: parsedNumbers.maxHourlyPrice },
-    }),
-    ...((maxDailyPrice !== undefined) && {
-      dailyPrice: { lte: parsedNumbers.maxDailyPrice },
-    }),
   }
 
   const vehicles = await prisma.vehicle.findMany({
     where,
     orderBy: { createdAt: 'desc' },
   })
-  return res.json({ vehicles })
+  return res.json({ vehicles: vehicles.map(publicVehicle) })
 })
 
 router.get('/:id/availability', async (req, res) => {
@@ -176,10 +171,6 @@ router.get('/:id', async (req, res) => {
       ac: true,
       luggage: true,
       description: true,
-      hourlyPrice: true,
-      dailyPrice: true,
-      eventPrice: true,
-      outstationPrice: true,
       rating: true,
       reviewCount: true,
       tripCount: true,
@@ -261,7 +252,7 @@ router.get('/:id', async (req, res) => {
     return res.status(404).json({ message: 'Vehicle not found' })
   }
 
-  return res.json({ vehicle })
+  return res.json({ vehicle: publicVehicle(vehicle) })
 })
 
 router.post('/', requireAuth, requireAdmin, async (req, res) => {

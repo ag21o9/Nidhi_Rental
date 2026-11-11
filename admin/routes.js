@@ -1,12 +1,17 @@
 import { Router } from 'express'
+import { randomInt, randomUUID } from 'node:crypto'
+import { Prisma } from '../generated/prisma/client.js'
 import { prisma } from '../database/client.js'
 import { createToken, requireAdminOrStaff, requireAuth } from '../middleware/auth.js'
+import { parseBookingPricing } from '../bookings/pricing.js'
 
 const router = Router()
 const bookingStatuses = ['PENDING', 'PAYMENT_PENDING', 'CONFIRMED', 'DRIVER_ASSIGNED', 'READY_FOR_PICKUP', 'ONGOING', 'COMPLETED', 'CANCELLED', 'REFUND_PENDING', 'REFUNDED']
 const changedByTypes = ['ADMIN', 'STAFF']
 const driverStatuses = ['AVAILABLE', 'ASSIGNED', 'ON_TRIP', 'OFFLINE', 'SUSPENDED']
 const categories = ['SEDAN', 'SUV', 'LUXURY', 'MUV', 'HATCHBACK', 'TEMPO_TRAVELLER', 'BUS']
+const bookingTypes = ['HOURLY', 'DAILY', 'EVENT', 'OUTSTATION']
+const driverOptions = ['SELF_DRIVE', 'WITH_DRIVER']
 
 function publicUser(user) {
   const { passwordHash, ...safeUser } = user
@@ -30,6 +35,36 @@ function bookingInclude() {
   }
 }
 
+function dateWithTime(date, time, fallbackHour = 0) {
+  const value = new Date(date)
+  if (!time) {
+    value.setUTCHours(fallbackHour, 0, 0, 0)
+    return value
+  }
+  const match = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(time)
+  if (!match) return null
+  value.setUTCHours(Number(match[1]), Number(match[2]), 0, 0)
+  return value
+}
+
+function bookingInterval(booking) {
+  const start = dateWithTime(booking.startDate, booking.startTime)
+  const end = booking.endTime
+    ? dateWithTime(booking.endDate, booking.endTime)
+    : dateWithTime(new Date(new Date(booking.endDate).getTime() + 86400000), null)
+  return start && end && start < end ? { start, end } : null
+}
+
+function overlaps(first, second) {
+  return second && first.start < second.end && first.end > second.start
+}
+
+function routeError(message, statusCode) {
+  const error = new Error(message)
+  error.statusCode = statusCode
+  return error
+}
+
 router.post('/login', async (req, res) => {
   const { email, password } = req.body
   if (!email || !password) {
@@ -44,6 +79,175 @@ router.post('/login', async (req, res) => {
 })
 
 router.use(requireAuth, requireAdminOrStaff)
+
+router.post('/bookings', async (req, res) => {
+  const request = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {}
+  const {
+    vehicleId,
+    bookingType = 'DAILY',
+    driverOption = 'SELF_DRIVE',
+    startDate,
+    endDate,
+    startTime,
+    endTime,
+    durationHours,
+    pickupLocation,
+    dropLocation,
+    purpose,
+    pricing: pricingInput,
+  } = request
+  const customer = request.customer || {}
+  const customerName = typeof customer.name === 'string' ? customer.name.trim() : ''
+  const customerEmail = typeof customer.email === 'string' ? customer.email.trim().toLowerCase() : ''
+  const customerPhone = typeof customer.phone === 'string' ? customer.phone.trim() : ''
+  const pricing = parseBookingPricing(pricingInput)
+
+  if (!customerName || !customerEmail || !customerPhone || !vehicleId || !startDate || !endDate || !pickupLocation || !dropLocation) {
+    return res.status(400).json({ message: 'customer name, email and phone, vehicleId, dates, pickup/drop locations, and pricing are required' })
+  }
+  if (!/^\S+@\S+\.\S+$/.test(customerEmail)) {
+    return res.status(400).json({ message: 'customer.email must be a valid email address' })
+  }
+  if (!bookingTypes.includes(bookingType) || !driverOptions.includes(driverOption)) {
+    return res.status(400).json({ message: 'Invalid bookingType or driverOption' })
+  }
+  if (durationHours !== undefined && (!Number.isInteger(durationHours) || durationHours < 1)) {
+    return res.status(400).json({ message: 'durationHours must be a positive whole number' })
+  }
+  if (purpose !== undefined && typeof purpose !== 'string') {
+    return res.status(400).json({ message: 'purpose must be a string' })
+  }
+  if (!pricing) {
+    return res.status(400).json({ message: 'A positive vehicleRental and valid non-negative charges, taxes, discount, and advanceAmount are required' })
+  }
+
+  const bookingStart = new Date(startDate)
+  const bookingEnd = new Date(endDate)
+  if (Number.isNaN(bookingStart.getTime()) || Number.isNaN(bookingEnd.getTime()) || bookingStart > bookingEnd) {
+    return res.status(400).json({ message: 'startDate and endDate must be valid dates, and startDate must not be after endDate' })
+  }
+  const requestedInterval = bookingInterval({ startDate: bookingStart, endDate: bookingEnd, startTime, endTime })
+  if (!requestedInterval) {
+    return res.status(400).json({ message: 'startTime and endTime must use HH:mm format and define a valid time range' })
+  }
+  if (typeof pickupLocation !== 'object' || Array.isArray(pickupLocation) || typeof dropLocation !== 'object' || Array.isArray(dropLocation)) {
+    return res.status(400).json({ message: 'pickupLocation and dropLocation must be objects' })
+  }
+
+  try {
+    const result = await prisma.$transaction(async (transaction) => {
+      const vehicle = await transaction.vehicle.findUnique({ where: { id: vehicleId } })
+      if (!vehicle || !vehicle.available) {
+        throw routeError('Available vehicle not found', 404)
+      }
+
+      const candidateBookings = await transaction.booking.findMany({
+        where: {
+          vehicleId,
+          startDate: { lte: bookingEnd },
+          endDate: { gte: bookingStart },
+          status: { notIn: ['CANCELLED', 'REFUNDED'] },
+        },
+        select: { bookingNumber: true, startDate: true, endDate: true, startTime: true, endTime: true },
+      })
+      const conflictingBooking = candidateBookings.find((candidate) => overlaps(requestedInterval, bookingInterval(candidate)))
+      const candidateBlocks = await transaction.vehicleAvailability.findMany({
+        where: { vehicleId, startAt: { lt: requestedInterval.end }, endAt: { gt: requestedInterval.start } },
+        select: { reason: true, startAt: true, endAt: true },
+      })
+      const conflictingBlock = candidateBlocks.find((block) => overlaps(requestedInterval, block))
+      if (conflictingBooking || conflictingBlock) {
+        const description = conflictingBooking
+          ? `booking ${conflictingBooking.bookingNumber}`
+          : `availability block${conflictingBlock.reason ? ` (${conflictingBlock.reason})` : ''}`
+        throw routeError(`Vehicle is not available because of an existing ${description}`, 409)
+      }
+
+      const matchedUsers = await transaction.user.findMany({
+        where: { OR: [{ email: customerEmail }, { phone: customerPhone }] },
+        select: { id: true, name: true, email: true, phone: true, status: true },
+      })
+      const emailMatch = matchedUsers.find((user) => user.email === customerEmail)
+      const phoneMatch = matchedUsers.find((user) => user.phone === customerPhone)
+      if ((emailMatch && phoneMatch && emailMatch.id !== phoneMatch.id)
+        || (emailMatch && emailMatch.phone !== customerPhone)
+        || (phoneMatch && phoneMatch.email !== customerEmail)) {
+        throw routeError('The customer email and phone must belong to the same account', 409)
+      }
+
+      let customerAccount = emailMatch || phoneMatch
+      let temporaryPassword
+      if (customerAccount && customerAccount.status !== 'ACTIVE') {
+        throw routeError('The customer account is not active', 409)
+      }
+      if (!customerAccount) {
+        temporaryPassword = String(randomInt(100000, 1000000))
+        customerAccount = await transaction.user.create({
+          data: {
+            name: customerName,
+            email: customerEmail,
+            phone: customerPhone,
+            passwordHash: temporaryPassword,
+          },
+          select: { id: true, name: true, email: true, phone: true, status: true },
+        })
+      }
+
+      const booking = await transaction.booking.create({
+        data: {
+          bookingNumber: `NR-${randomUUID().slice(0, 8).toUpperCase()}`,
+          userId: customerAccount.id,
+          vehicleId,
+          bookingType,
+          driverOption,
+          startDate: bookingStart,
+          endDate: bookingEnd,
+          startTime,
+          endTime,
+          durationHours,
+          pickupLocationJson: pickupLocation,
+          dropLocationJson: dropLocation,
+          purpose,
+          ...pricing,
+          status: 'CONFIRMED',
+        },
+        include: {
+          user: { select: { id: true, name: true, email: true, phone: true } },
+          vehicle: true,
+        },
+      })
+
+      await transaction.bookingStatusHistory.create({
+        data: {
+          bookingId: booking.id,
+          toStatus: 'CONFIRMED',
+          changedByType: req.user.role,
+          changedById: req.user.id,
+          reason: 'Booked directly by admin or staff',
+        },
+      })
+
+      return { booking, temporaryPassword }
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable })
+
+    return res.status(201).json({
+      booking: result.booking,
+      customerCreated: Boolean(result.temporaryPassword),
+      ...(result.temporaryPassword && { temporaryPassword: result.temporaryPassword }),
+    })
+  } catch (error) {
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({ message: error.message })
+    }
+    if (error.code === 'P2034') {
+      return res.status(409).json({ message: 'The vehicle was booked concurrently. Please retry.' })
+    }
+    if (error.code === 'P2002') {
+      return res.status(409).json({ message: 'An account already exists with this customer email or phone' })
+    }
+    throw error
+  }
+})
 
 router.get('/analytics/overview', async (req, res) => {
   const range = typeof req.query.range === 'string' && /^\d+d$/.test(req.query.range) ? Number.parseInt(req.query.range, 10) : 7
@@ -174,10 +378,16 @@ router.patch('/bookings/:id/status', async (req, res) => {
   if (!bookingStatuses.includes(status) || !changedByTypes.includes(changedByType)) {
     return res.status(400).json({ message: 'Valid status and changedByType are required' })
   }
+  const pricing = status === 'CONFIRMED' ? parseBookingPricing(req.body) : null
+  if (status === 'CONFIRMED' && !pricing) {
+    return res.status(400).json({
+      message: 'A positive vehicleRental and valid non-negative charges, taxes, discount, and advanceAmount are required to confirm a booking',
+    })
+  }
   const booking = await prisma.$transaction(async (transaction) => {
     const current = await transaction.booking.findUnique({ where: { id: req.params.id } })
     if (!current) { const error = new Error('Booking not found'); error.statusCode = 404; throw error }
-    const updated = await transaction.booking.update({ where: { id: current.id }, data: { status }, include: bookingInclude() })
+    const updated = await transaction.booking.update({ where: { id: current.id }, data: { status, ...(pricing || {}) }, include: bookingInclude() })
     await transaction.bookingStatusHistory.create({ data: { bookingId: current.id, fromStatus: current.status, toStatus: status, changedByType, changedById: req.user.id, reason } })
     return updated
   })
